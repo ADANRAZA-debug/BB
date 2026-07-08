@@ -8,22 +8,24 @@ listener, run it on a real host you control (a VPS/VM) - GitHub Actions
 does not support and does not permit long-running/persistent workloads,
 so this script deliberately does one bounded pass per invocation:
 
-  1. Pull a snapshot of recent CT log activity (crt.sh direct Postgres
-     connection if available, else its HTTPS JSON API) for a short list
-     of security-related keywords.
-  2. Phase 1 - keyword regex filter on the resulting hostnames.
-  3. Phase 2 - live DNS resolution check (socket) before any HTTP request.
-  4. Phase 3 - strict fingerprinting: fetch security.txt / common
-     disclosure paths with browser-like headers, 4s timeout, full
-     redirect-chain tracking.
-  5. Phase 4 - Gemini Flash validation: confirms independent, self-hosted,
-     rewarded (cash or hall-of-fame) Web2 program; explicitly rejects
-     platform-mediated pages and enterprise/on-prem product security
-     notices (e.g. Atlassian, SAP).
-  6. Writes verified hits to results.json, posts a rich alert to Discord
-     for each one, and posts a brief STATUS PING every run regardless of
-     outcome (so you can confirm the schedule is actually firing without
-     checking the Actions tab) - includes any errors encountered.
+   1. Pull a snapshot of recent CT log activity from multiple sources:
+      - crt.sh HTTPS JSON API (primary, rate-limited)
+      - Censys API (alternative, requires free API key)
+      - CertSpotter API (alternative, no key needed)
+      - Direct DB fallback (if psycopg2 available)
+   2. Phase 1 - keyword regex filter on the resulting hostnames.
+   3. Phase 2 - live DNS resolution check (socket) before any HTTP request.
+   4. Phase 3 - strict fingerprinting: fetch security.txt / common
+      disclosure paths with browser-like headers, 4s timeout, full
+      redirect-chain tracking.
+   5. Phase 4 - Gemini Flash validation: confirms independent, self-hosted,
+      rewarded (cash or hall-of-fame) Web2 program; explicitly rejects
+      platform-mediated pages and enterprise/on-prem product security
+      notices (e.g. Atlassian, SAP).
+   6. Writes verified hits to results.json, posts a rich alert to Discord
+      for each one, and posts a brief STATUS PING every run regardless of
+      outcome (so you can confirm the schedule is actually firing without
+      checking the Actions tab) - includes any errors encountered.
 
 Exits gracefully (code 0) after a configurable time budget so it fits
 cleanly inside a scheduled Actions run.
@@ -47,6 +49,8 @@ Environment variables optional:
     CRTSH_KEYWORDS            - comma-separated, default "bugbounty,vdp"
     STATE_FILE_PATH           - default "state.json"
     RESULTS_OUTPUT_PATH       - default "results.json"
+    CENSYS_API_ID             - optional Censys API ID (free tier at censys.io)
+    CENSYS_API_SECRET         - optional Censys API secret
 """
 
 import json
@@ -57,6 +61,7 @@ import socket
 import sys
 import time
 import ipaddress
+import base64
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -76,6 +81,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 TIME_BUDGET_MINUTES = float(os.environ.get("SCAN_TIME_BUDGET_MINUTES", "50"))
 CRTSH_KEYWORDS = [k.strip() for k in os.environ.get("CRTSH_KEYWORDS", "bugbounty,vdp").split(",") if k.strip()]
+
+# Optional alternative sources
+CENSYS_API_ID = os.environ.get("CENSYS_API_ID", "").strip()
+CENSYS_API_SECRET = os.environ.get("CENSYS_API_SECRET", "").strip()
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -198,7 +207,7 @@ def send_status_ping(webhook_url, run_summary):
         f"Window scanned: last {run_summary['window_minutes']:.0f} minutes",
         f"Hostnames processed: {run_summary['processed']}",
         f"Verified hits: {run_summary['verified_hits']}",
-        f"crt.sh path used: {run_summary['crtsh_path']}",
+        f"CT sources used: {run_summary['ct_sources']}",
     ]
     if run_summary["errors"]:
         description_lines.append("")
@@ -220,11 +229,11 @@ def send_status_ping(webhook_url, run_summary):
 
 
 # ---------------------------------------------------------------------------
-# CT log snapshot retrieval (crt.sh direct DB preferred, HTTPS JSON fallback)
+# CT log snapshot retrieval (multi-source)
 # ---------------------------------------------------------------------------
 
 CRTSH_DB_MAX_ATTEMPTS = 3
-CRTSH_DB_BACKOFF_BASE_SECONDS = 8.0   # 8s, 16s, 32s (+ jitter) between attempts
+CRTSH_DB_BACKOFF_BASE_SECONDS = 8.0
 CRTSH_HTTPS_MAX_ATTEMPTS = 3
 CRTSH_HTTPS_BACKOFF_BASE_SECONDS = 10.0
 
@@ -242,14 +251,6 @@ def crtsh_query_db(keyword, since_minutes):
     (psql -h crt.sh -p 5432 -U guest certwatch - officially documented by
     crt.sh's maintainer: https://groups.google.com/g/crtsh). Bypasses the
     HTTPS proxy's rate limit/timeout.
-
-    crt.sh's own maintainers have repeatedly confirmed on the mailing list
-    (groups.google.com/g/crtsh) that both crt.sh:443 and crt.sh:5432
-    suffer from real, but transient, overload/outage windows (pgbouncer
-    crashes, storage-array saturation, 502s). Their own stated guidance
-    when this happens is to wait and retry rather than treat it as a
-    permanent failure, so this function retries with exponential backoff
-    before giving up and falling back to HTTPS.
 
     Returns a list of (hostname, not_before) tuples, or None if every
     attempt failed (transient outage, not necessarily "no results").
@@ -296,10 +297,8 @@ def crtsh_query_db(keyword, since_minutes):
 
 
 def crtsh_query_https(keyword, since_minutes):
-    """HTTPS JSON API fallback - rate-limited to respect crt.sh's real
-    5 requests/minute limit per IP, and retried with backoff since
-    crt.sh's maintainers confirm 502s/timeouts under load are transient
-    (see groups.google.com/g/crtsh) rather than permanent failures."""
+    """HTTPS JSON API - rate-limited to respect crt.sh's real 5 requests/minute
+    limit per IP, and retried with backoff."""
     last_status = None
     for attempt in range(CRTSH_HTTPS_MAX_ATTEMPTS):
         if attempt > 0:
@@ -315,7 +314,7 @@ def crtsh_query_https(keyword, since_minutes):
                 "https://crt.sh/",
                 params={"q": f"%{keyword}%", "output": "json"},
                 timeout=45,
-                headers={"User-Agent": "scanner.py/1.0 (+https://github.com/)"},
+                headers={"User-Agent": "scanner.py/2.0 (+https://github.com/)"},
             )
         except requests.exceptions.Timeout:
             log(f"crt.sh HTTPS query timed out for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS})")
@@ -329,8 +328,7 @@ def crtsh_query_https(keyword, since_minutes):
 
         last_status = resp.status_code
 
-        # 429/502/503/504 are exactly the transient overload signatures
-        # crt.sh's own maintainers describe - worth a retry.
+        # Transient errors worth retrying
         if resp.status_code in (429, 502, 503, 504):
             log(f"crt.sh HTTPS returned HTTP {resp.status_code} for '{keyword}' "
                 f"(attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}), likely transient overload")
@@ -343,8 +341,7 @@ def crtsh_query_https(keyword, since_minutes):
         try:
             entries = resp.json()
         except json.JSONDecodeError:
-            log(f"crt.sh HTTPS returned non-JSON for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}), "
-                f"likely rate-limited/overloaded")
+            log(f"crt.sh HTTPS returned non-JSON for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS})")
             continue
 
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
@@ -369,48 +366,159 @@ def crtsh_query_https(keyword, since_minutes):
     return []
 
 
+def censys_query(keyword, since_minutes):
+    """Query Censys certificate API (free tier available at censys.io)."""
+    if not CENSYS_API_ID or not CENSYS_API_SECRET:
+        return []
+
+    auth = base64.b64encode(f"{CENSYS_API_ID}:{CENSYS_API_SECRET}".encode()).decode()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+
+    try:
+        resp = requests.get(
+            "https://www.censys.io/api/v1/search/certificates",
+            params={"q": f"{keyword}", "sort": "timestamp"},
+            headers={"Authorization": f"Basic {auth}", "User-Agent": "scanner.py/2.0"},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        log(f"Censys query failed for '{keyword}': {e}")
+        return []
+
+    if resp.status_code != 200:
+        log(f"Censys returned HTTP {resp.status_code} for '{keyword}'")
+        return []
+
+    try:
+        data = resp.json()
+        results = []
+        for cert in data.get("results", []):
+            names = cert.get("names", [])
+            timestamp_raw = cert.get("timestamp", "")
+            try:
+                timestamp = datetime.strptime(timestamp_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if timestamp < cutoff:
+                continue
+            for name in names:
+                name_clean = name.strip().lstrip("*.")
+                if name_clean:
+                    results.append((name_clean, timestamp))
+        log(f"Censys returned {len(results)} hostnames for '{keyword}'")
+        return results
+    except (json.JSONDecodeError, KeyError, IndexError):
+        log(f"Censys response parsing failed for '{keyword}'")
+        return []
+
+
+def certspotter_query(keyword, since_minutes):
+    """Query CertSpotter API (free, no key required)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+
+    try:
+        resp = requests.get(
+            "https://api.certspotter.com/v1/issuances",
+            params={"domain": keyword, "expand": "dns_names"},
+            headers={"User-Agent": "scanner.py/2.0"},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        log(f"CertSpotter query failed for '{keyword}': {e}")
+        return []
+
+    if resp.status_code != 200:
+        log(f"CertSpotter returned HTTP {resp.status_code} for '{keyword}'")
+        return []
+
+    try:
+        data = resp.json()
+        results = []
+        for cert in data:
+            dns_names = cert.get("dns_names", [])
+            timestamp_raw = cert.get("issued_at", "")
+            try:
+                timestamp = datetime.strptime(timestamp_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if timestamp < cutoff:
+                continue
+            for name in dns_names:
+                name_clean = name.strip().lstrip("*.")
+                if name_clean:
+                    results.append((name_clean, timestamp))
+        log(f"CertSpotter returned {len(results)} hostnames for '{keyword}'")
+        return results
+    except (json.JSONDecodeError, KeyError, IndexError):
+        log(f"CertSpotter response parsing failed for '{keyword}'")
+        return []
+
+
 def fetch_ct_snapshot(since_minutes, run_errors):
-    """Returns (results, path_used) - deduplicated list of (hostname,
-    not_before) tuples across all configured keywords, using the direct
-    DB path when available, plus a label of which path actually worked."""
+    """Returns (results, sources_used) - deduplicated list of (hostname,
+    not_before) tuples across all configured keywords and sources."""
     all_results = {}
-    used_db = False
-    used_https = False
-    any_keyword_failed = False
+    sources_used = []
+    used_crtsh_db = False
+    used_crtsh_https = False
+    used_censys = False
+    used_certspotter = False
 
     for keyword in CRTSH_KEYWORDS:
         if time_budget_exceeded():
             log("Time budget exceeded during CT snapshot retrieval, stopping early")
             run_errors.append("Time budget exceeded during CT snapshot retrieval - results may be incomplete")
             break
+
+        # Try direct DB first
         rows = crtsh_query_db(keyword, since_minutes)
         if rows is not None:
-            used_db = True
+            used_crtsh_db = True
+            for host, not_before in rows:
+                if host not in all_results or not_before > all_results[host]:
+                    all_results[host] = not_before
+            log(f"crt.sh direct DB: {len(rows)} hostnames for '{keyword}'")
         else:
-            log(f"Falling back to crt.sh HTTPS JSON API for keyword '{keyword}' (psycopg2 unavailable or DB query failed)")
+            # Fallback to HTTPS
+            log(f"Falling back to crt.sh HTTPS JSON API for keyword '{keyword}'")
             rows = crtsh_query_https(keyword, since_minutes)
             if rows:
-                used_https = True
-            else:
-                any_keyword_failed = True
-        for host, not_before in rows:
-            if host not in all_results or not_before > all_results[host]:
-                all_results[host] = not_before
+                used_crtsh_https = True
+                for host, not_before in rows:
+                    if host not in all_results or not_before > all_results[host]:
+                        all_results[host] = not_before
 
-    if used_db and used_https:
-        path_used = "direct DB (partial) + HTTPS fallback"
-    elif used_db:
-        path_used = "direct DB"
-    elif used_https:
-        path_used = "HTTPS JSON (fallback)"
-    else:
-        path_used = "FAILED - no data retrieved"
-        run_errors.append("crt.sh returned no data on either path (direct DB or HTTPS) - check connectivity")
+        # Try Censys as supplementary source
+        rows = censys_query(keyword, since_minutes)
+        if rows:
+            used_censys = True
+            for host, not_before in rows:
+                if host not in all_results or not_before > all_results[host]:
+                    all_results[host] = not_before
 
-    if any_keyword_failed and used_db is False and used_https is False:
-        pass  # already captured above
+        # Try CertSpotter as supplementary source
+        rows = certspotter_query(keyword, since_minutes)
+        if rows:
+            used_certspotter = True
+            for host, not_before in rows:
+                if host not in all_results or not_before > all_results[host]:
+                    all_results[host] = not_before
 
-    return list(all_results.items()), path_used
+    # Build sources list
+    if used_crtsh_db:
+        sources_used.append("crt.sh DB")
+    if used_crtsh_https:
+        sources_used.append("crt.sh HTTPS")
+    if used_censys:
+        sources_used.append("Censys")
+    if used_certspotter:
+        sources_used.append("CertSpotter")
+
+    if not sources_used:
+        sources_used = ["FAILED - no data from any source"]
+        run_errors.append("CT snapshot: no data retrieved from crt.sh, Censys, or CertSpotter - check connectivity and API keys")
+
+    return list(all_results.items()), ", ".join(sources_used)
 
 
 # ---------------------------------------------------------------------------
@@ -610,8 +718,9 @@ def main():
     run_start_wall = time.time()
     run_errors = []
 
-    log(f"scanner.py starting - time budget {TIME_BUDGET_MINUTES} minutes")
+    log(f"scanner.py v2.0 starting - time budget {TIME_BUDGET_MINUTES} minutes")
     log(f"Direct crt.sh Postgres access: {'available' if HAVE_PSYCOPG2 else 'not installed, using HTTPS fallback'}")
+    log(f"Optional sources: Censys={'configured' if CENSYS_API_ID else 'not configured'}, CertSpotter=always available")
 
     if not GEMINI_API_KEY:
         run_errors.append("GEMINI_API_KEY not set - no candidate can be verified this run")
@@ -624,8 +733,8 @@ def main():
     since_minutes = compute_scan_window_minutes(state_path, overlap_minutes, max_window_minutes)
 
     log(f"Fetching CT snapshot for keywords {CRTSH_KEYWORDS}, window {since_minutes:.0f} minutes")
-    ct_hits, crtsh_path_used = fetch_ct_snapshot(since_minutes, run_errors)
-    log(f"CT snapshot returned {len(ct_hits)} raw hostnames via: {crtsh_path_used}")
+    ct_hits, ct_sources = fetch_ct_snapshot(since_minutes, run_errors)
+    log(f"CT snapshot returned {len(ct_hits)} raw hostnames from: {ct_sources}")
 
     verified_results = []
     processed_count = 0
@@ -682,7 +791,7 @@ def main():
                 "run_completed_at": datetime.now(timezone.utc).isoformat(),
                 "window_minutes_scanned": since_minutes,
                 "hostnames_processed": processed_count,
-                "crtsh_path_used": crtsh_path_used,
+                "ct_sources_used": ct_sources,
                 "errors": run_errors,
                 "verified_hits": verified_results,
             }, f, indent=2)
@@ -691,11 +800,8 @@ def main():
         log(f"Failed to write results file: {e}")
         run_errors.append(f"Failed to write results file: {e}")
 
-    # Only advance the state timestamp if the run actually got through the
-    # CT fetch stage - if crt.sh totally failed, keep the old timestamp so
-    # the next run's overlap window still covers this gap instead of
-    # silently skipping it.
-    if crtsh_path_used != "FAILED - no data retrieved":
+    # Only advance state if we got any CT data
+    if "FAILED" not in ct_sources:
         save_state(state_path, datetime.now(timezone.utc))
     else:
         log("Not advancing state timestamp since this run got no CT data - next run will retry this window")
@@ -705,7 +811,7 @@ def main():
         "window_minutes": since_minutes,
         "processed": processed_count,
         "verified_hits": len(verified_results),
-        "crtsh_path": crtsh_path_used,
+        "ct_sources": ct_sources,
         "errors": run_errors,
         "duration_seconds": duration_seconds,
     })
@@ -720,15 +826,11 @@ if __name__ == "__main__":
         log("Interrupted, exiting cleanly")
         exit_code = 0
     except Exception as e:
-        # Catch-all so a single unhandled exception never fails the whole
-        # scheduled Actions run with a red X - log it, try to ping Discord
-        # about it too, and exit 0 since this is a best-effort discovery
-        # scan, not a required build step.
         log(f"Unhandled exception, exiting cleanly anyway: {type(e).__name__}: {e}")
         try:
             send_status_ping(DISCORD_WEBHOOK_URL, {
                 "window_minutes": 0, "processed": 0, "verified_hits": 0,
-                "crtsh_path": "unknown", "duration_seconds": 0,
+                "ct_sources": "unknown", "duration_seconds": 0,
                 "errors": [f"Unhandled exception: {type(e).__name__}: {e}"],
             })
         except Exception:
