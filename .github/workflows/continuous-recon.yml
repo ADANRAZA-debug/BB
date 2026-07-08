@@ -1,0 +1,84 @@
+name: Self-Hosted BBP Discovery Scan
+
+# Runs on a normal cron schedule - a bounded, scheduled job, NOT a
+# persistent process or a self-retriggering repository_dispatch loop.
+# GitHub Actions does not support and does not permit workflows used as
+# a substitute for an always-on server (see GitHub's Acceptable Use
+# Policies). Every run here does one bounded pass and exits.
+#
+# Every 30 minutes is deliberate, not arbitrary: crt.sh (whichever path
+# is used) and Gemini's free tier don't meaningfully benefit from being
+# polled more often than this, and state.json makes each run pick up
+# exactly where the last one left off - so 30 min intervals still catch
+# everything continuously, just without the overhead of nonstop polling.
+#
+# If you need a true persistent certstream websocket listener, run
+# scanner.py's underlying logic on a real host you control instead -
+# GitHub-hosted runners are the wrong tool for that specific job.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch:          # manual trigger from the Actions tab
+
+concurrency:
+  group: bbp-discovery-scan
+  cancel-in-progress: false   # never kill a run already in progress
+
+permissions:
+  contents: write   # needed to commit state.json back to the repo
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55   # hard platform-level backstop above the script's own 50-min budget
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Run scanner (bounded, single pass)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SCAN_TIME_BUDGET_MINUTES: '50'
+          SCAN_WINDOW_MINUTES: '1440'
+          SCAN_OVERLAP_MINUTES: '10'
+          CRTSH_KEYWORDS: 'bugbounty,vdp'
+          STATE_FILE_PATH: 'state.json'
+          RESULTS_OUTPUT_PATH: 'results.json'
+        run: python3 scanner.py
+
+      - name: Upload results as build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_id }}
+          path: results.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Commit updated state.json back to the repo
+        if: always()
+        run: |
+          git config user.name "bbp-scanner-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -f state.json ]; then
+            git add state.json
+            git diff --cached --quiet || git commit -m "chore: update scan state [skip ci]"
+            git push
+          else
+            echo "No state.json produced this run, nothing to commit"
+          fi
