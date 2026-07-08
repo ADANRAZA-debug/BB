@@ -51,6 +51,7 @@ Environment variables optional:
 
 import json
 import os
+import random
 import re
 import socket
 import sys
@@ -222,95 +223,150 @@ def send_status_ping(webhook_url, run_summary):
 # CT log snapshot retrieval (crt.sh direct DB preferred, HTTPS JSON fallback)
 # ---------------------------------------------------------------------------
 
+CRTSH_DB_MAX_ATTEMPTS = 3
+CRTSH_DB_BACKOFF_BASE_SECONDS = 8.0   # 8s, 16s, 32s (+ jitter) between attempts
+CRTSH_HTTPS_MAX_ATTEMPTS = 3
+CRTSH_HTTPS_BACKOFF_BASE_SECONDS = 10.0
+
+
+def _sleep_with_backoff(attempt, base_seconds):
+    """Exponential backoff with jitter. attempt is 0-indexed."""
+    delay = base_seconds * (2 ** attempt) + random.uniform(0, base_seconds / 2)
+    log(f"Backing off {delay:.1f}s before retry (attempt {attempt + 2})")
+    time.sleep(delay)
+
+
 def crtsh_query_db(keyword, since_minutes):
     """
     Direct connection to crt.sh's public, read-only Postgres database
     (psql -h crt.sh -p 5432 -U guest certwatch - officially documented by
-    crt.sh's maintainer). Bypasses the HTTPS proxy's rate limit/timeout.
-    Returns a list of (hostname, not_before) tuples, or None on failure.
+    crt.sh's maintainer: https://groups.google.com/g/crtsh). Bypasses the
+    HTTPS proxy's rate limit/timeout.
+
+    crt.sh's own maintainers have repeatedly confirmed on the mailing list
+    (groups.google.com/g/crtsh) that both crt.sh:443 and crt.sh:5432
+    suffer from real, but transient, overload/outage windows (pgbouncer
+    crashes, storage-array saturation, 502s). Their own stated guidance
+    when this happens is to wait and retry rather than treat it as a
+    permanent failure, so this function retries with exponential backoff
+    before giving up and falling back to HTTPS.
+
+    Returns a list of (hostname, not_before) tuples, or None if every
+    attempt failed (transient outage, not necessarily "no results").
     """
     if not HAVE_PSYCOPG2:
         return None
-    try:
-        conn = psycopg2.connect(
-            host="crt.sh", port=5432, dbname="certwatch", user="guest",
-            connect_timeout=15,
-            options="-c statement_timeout=45000",
-        )
-        conn.autocommit = True
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-        sql = """
-            SELECT DISTINCT ci.NAME_VALUE, x509_notBefore(c.CERTIFICATE) AS not_before
-            FROM certificate_and_identities ci
-            JOIN certificate c ON ci.CERTIFICATE_ID = c.ID
-            WHERE ci.NAME_VALUE ILIKE %s
-              AND x509_notBefore(c.CERTIFICATE) > %s
-            ORDER BY not_before DESC
-            LIMIT 500;
-        """
+
+    last_error = None
+    for attempt in range(CRTSH_DB_MAX_ATTEMPTS):
+        if attempt > 0:
+            _sleep_with_backoff(attempt - 1, CRTSH_DB_BACKOFF_BASE_SECONDS)
         try:
-            with conn.cursor() as cur:
-                cur.execute(sql, (f"%{keyword}%", cutoff))
-                rows = cur.fetchall()
-                return [(r[0], r[1]) for r in rows]
-        finally:
-            conn.close()
-    except Exception as e:
-        log(f"crt.sh direct DB query failed for '{keyword}': {type(e).__name__}: {e}")
-        return None
+            conn = psycopg2.connect(
+                host="crt.sh", port=5432, dbname="certwatch", user="guest",
+                connect_timeout=20,
+                options="-c statement_timeout=60000",
+            )
+            conn.autocommit = True
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+            sql = """
+                SELECT DISTINCT ci.NAME_VALUE, x509_notBefore(c.CERTIFICATE) AS not_before
+                FROM certificate_and_identities ci
+                JOIN certificate c ON ci.CERTIFICATE_ID = c.ID
+                WHERE ci.NAME_VALUE ILIKE %s
+                  AND x509_notBefore(c.CERTIFICATE) > %s
+                ORDER BY not_before DESC
+                LIMIT 500;
+            """
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (f"%{keyword}%", cutoff))
+                    rows = cur.fetchall()
+                    return [(r[0], r[1]) for r in rows]
+            finally:
+                conn.close()
+        except Exception as e:
+            last_error = e
+            log(f"crt.sh direct DB query failed for '{keyword}' "
+                f"(attempt {attempt + 1}/{CRTSH_DB_MAX_ATTEMPTS}): {type(e).__name__}: {e}")
+
+    log(f"crt.sh direct DB query gave up on '{keyword}' after {CRTSH_DB_MAX_ATTEMPTS} attempts: "
+        f"{type(last_error).__name__ if last_error else 'unknown error'}")
+    return None
 
 
 def crtsh_query_https(keyword, since_minutes):
     """HTTPS JSON API fallback - rate-limited to respect crt.sh's real
-    5 requests/minute limit per IP."""
-    elapsed = time.time() - _last_crtsh_call[0]
-    if elapsed < CRTSH_MIN_INTERVAL_SECONDS:
-        time.sleep(CRTSH_MIN_INTERVAL_SECONDS - elapsed)
-    _last_crtsh_call[0] = time.time()
+    5 requests/minute limit per IP, and retried with backoff since
+    crt.sh's maintainers confirm 502s/timeouts under load are transient
+    (see groups.google.com/g/crtsh) rather than permanent failures."""
+    last_status = None
+    for attempt in range(CRTSH_HTTPS_MAX_ATTEMPTS):
+        if attempt > 0:
+            _sleep_with_backoff(attempt - 1, CRTSH_HTTPS_BACKOFF_BASE_SECONDS)
 
-    try:
-        resp = requests.get(
-            "https://crt.sh/",
-            params={"q": f"%{keyword}%", "output": "json"},
-            timeout=45,
-            headers={"User-Agent": "scanner.py/1.0"},
-        )
-    except requests.exceptions.Timeout:
-        log(f"crt.sh HTTPS query timed out for '{keyword}'")
-        return []
-    except requests.exceptions.ConnectionError as e:
-        log(f"crt.sh HTTPS connection failed for '{keyword}': {e}")
-        return []
-    except requests.RequestException as e:
-        log(f"crt.sh HTTPS request failed for '{keyword}': {e}")
-        return []
+        elapsed = time.time() - _last_crtsh_call[0]
+        if elapsed < CRTSH_MIN_INTERVAL_SECONDS:
+            time.sleep(CRTSH_MIN_INTERVAL_SECONDS - elapsed)
+        _last_crtsh_call[0] = time.time()
 
-    if resp.status_code != 200:
-        log(f"crt.sh HTTPS returned HTTP {resp.status_code} for '{keyword}'")
-        return []
-
-    try:
-        entries = resp.json()
-    except json.JSONDecodeError:
-        log(f"crt.sh HTTPS returned non-JSON for '{keyword}' (likely rate-limited/overloaded)")
-        return []
-
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-    results = []
-    for entry in entries:
-        not_before_raw = entry.get("not_before", "")
         try:
-            not_before = datetime.strptime(not_before_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-        except ValueError:
+            resp = requests.get(
+                "https://crt.sh/",
+                params={"q": f"%{keyword}%", "output": "json"},
+                timeout=45,
+                headers={"User-Agent": "scanner.py/1.0 (+https://github.com/)"},
+            )
+        except requests.exceptions.Timeout:
+            log(f"crt.sh HTTPS query timed out for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS})")
             continue
-        if not_before < cutoff:
+        except requests.exceptions.ConnectionError as e:
+            log(f"crt.sh HTTPS connection failed for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}): {e}")
             continue
-        name_value = entry.get("name_value", "")
-        for host in set(name_value.split("\n")):
-            host = host.strip().lstrip("*.")
-            if host:
-                results.append((host, not_before))
-    return results
+        except requests.RequestException as e:
+            log(f"crt.sh HTTPS request failed for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}): {e}")
+            continue
+
+        last_status = resp.status_code
+
+        # 429/502/503/504 are exactly the transient overload signatures
+        # crt.sh's own maintainers describe - worth a retry.
+        if resp.status_code in (429, 502, 503, 504):
+            log(f"crt.sh HTTPS returned HTTP {resp.status_code} for '{keyword}' "
+                f"(attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}), likely transient overload")
+            continue
+
+        if resp.status_code != 200:
+            log(f"crt.sh HTTPS returned HTTP {resp.status_code} for '{keyword}' - not retrying (non-transient)")
+            return []
+
+        try:
+            entries = resp.json()
+        except json.JSONDecodeError:
+            log(f"crt.sh HTTPS returned non-JSON for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}), "
+                f"likely rate-limited/overloaded")
+            continue
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+        results = []
+        for entry in entries:
+            not_before_raw = entry.get("not_before", "")
+            try:
+                not_before = datetime.strptime(not_before_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if not_before < cutoff:
+                continue
+            name_value = entry.get("name_value", "")
+            for host in set(name_value.split("\n")):
+                host = host.strip().lstrip("*.")
+                if host:
+                    results.append((host, not_before))
+        return results
+
+    log(f"crt.sh HTTPS gave up on '{keyword}' after {CRTSH_HTTPS_MAX_ATTEMPTS} attempts "
+        f"(last status: {last_status})")
+    return []
 
 
 def fetch_ct_snapshot(since_minutes, run_errors):
