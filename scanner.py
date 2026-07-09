@@ -342,10 +342,15 @@ def crtsh_query_db(keyword, since_minutes):
         if attempt > 0:
             _sleep_with_backoff(attempt - 1, CRTSH_DB_BACKOFF_BASE_SECONDS)
         try:
+            # NOTE: deliberately no `options="-c statement_timeout=..."`
+            # startup parameter here. crt.sh's Postgres sits behind
+            # pgbouncer, which rejects arbitrary startup-packet options
+            # with "unsupported startup parameter: options" - this was a
+            # 100%-reproducible bug (not flakiness) that made every
+            # direct-DB attempt fail immediately, every single time.
             conn = psycopg2.connect(
                 host="crt.sh", port=5432, dbname="certwatch", user="guest",
                 connect_timeout=20,
-                options="-c statement_timeout=60000",
             )
             conn.autocommit = True
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
@@ -360,6 +365,16 @@ def crtsh_query_db(keyword, since_minutes):
             """
             try:
                 with conn.cursor() as cur:
+                    # Statement timeout set as a regular query instead of a
+                    # startup parameter, for the same pgbouncer reason above.
+                    # If pgbouncer is in transaction/statement pooling mode
+                    # this SET may be a no-op for the backend session, which
+                    # is fine - connect_timeout plus the outer retry/backoff
+                    # loop already bound worst-case behavior.
+                    try:
+                        cur.execute("SET statement_timeout = 60000;")
+                    except Exception:
+                        pass
                     cur.execute(sql, (f"%{keyword}%", cutoff))
                     rows = cur.fetchall()
                     return [(r[0], r[1]) for r in rows]
