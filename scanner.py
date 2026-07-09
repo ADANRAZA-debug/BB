@@ -3,27 +3,48 @@
 scanner.py - Self-hosted bug bounty program discovery scanner.
 
 Designed to run as a BOUNDED, SCHEDULED job (GitHub Actions cron trigger),
-not a persistent process. If you want a true always-on certstream websocket
-listener, run it on a real host you control (a VPS/VM) - GitHub Actions
-does not support and does not permit long-running/persistent workloads,
-so this script deliberately does one bounded pass per invocation:
+not a persistent process. GitHub Actions does not support/permit
+always-on workloads, so this script deliberately does one bounded pass
+per invocation and exits.
 
-  1. Pull a snapshot of recent CT log activity (crt.sh direct Postgres
-     connection if available, else its HTTPS JSON API) for a short list
-     of security-related keywords.
-  2. Phase 1 - keyword regex filter on the resulting hostnames.
-  3. Phase 2 - live DNS resolution check (socket) before any HTTP request.
-  4. Phase 3 - strict fingerprinting: fetch security.txt / common
+Two independent, free discovery sources are used together so the tool
+keeps finding new self-hosted (non-H1/Bugcrowd/Intigriti/YesWeHack/
+Synack/Open Bug Bounty) programs even if one source is degraded:
+
+  SOURCE 1 - crt.sh Certificate Transparency logs (direct Postgres,
+             falling back to the HTTPS JSON API), for keyword hits in
+             freshly-issued TLS certs (e.g. "bugbounty.example.com").
+             crt.sh is a free, volunteer-run service and is known to be
+             flaky/overloaded at times, and to rate-limit shared CI IP
+             ranges (like GitHub-hosted runners, which sit in Azure
+             datacenter space) harder than residential IPs. This script
+             retries with backoff, but a total failure here is logged as
+             a WARNING, not an error - discovery keeps working via
+             Source 2 regardless.
+
+  SOURCE 2 - disclose.io's community-maintained program-list.json
+             (github.com/disclose/diodb), diffed commit-by-commit since
+             the last run. This is just GitHub's own API, so it's fully
+             reliable from GitHub Actions, and catches new independent/
+             self-hosted VDP & bug bounty programs as soon as they're
+             added to the registry - usually within minutes to hours of
+             a program's public launch, since disclose.io is actively
+             maintained and PRs are merged quickly.
+
+Pipeline for every candidate hostname from either source:
+  1. Phase 1 - keyword regex filter.
+  2. Phase 2 - live DNS resolution check (socket) before any HTTP request.
+  3. Phase 3 - strict fingerprinting: fetch security.txt / common
      disclosure paths with browser-like headers, 4s timeout, full
      redirect-chain tracking.
-  5. Phase 4 - Gemini Flash validation: confirms independent, self-hosted,
+  4. Phase 4 - Gemini Flash validation: confirms independent, self-hosted,
      rewarded (cash or hall-of-fame) Web2 program; explicitly rejects
      platform-mediated pages and enterprise/on-prem product security
      notices (e.g. Atlassian, SAP).
-  6. Writes verified hits to results.json, posts a rich alert to Discord
+  5. Writes verified hits to results.json, posts a rich alert to Discord
      for each one, and posts a brief STATUS PING every run regardless of
      outcome (so you can confirm the schedule is actually firing without
-     checking the Actions tab) - includes any errors encountered.
+     checking the Actions tab) - includes any errors/warnings encountered.
 
 Exits gracefully (code 0) after a configurable time budget so it fits
 cleanly inside a scheduled Actions run.
@@ -35,6 +56,28 @@ State/continuity across runs:
     a small safety overlap) instead of re-scanning a fixed window every
     time. First run ever (no state.json) uses SCAN_WINDOW_MINUTES as a
     one-time fallback.
+
+--------------------------------------------------------------------------
+SECRET SAFETY (this script is designed to run in a PUBLIC repo):
+--------------------------------------------------------------------------
+  - GEMINI_API_KEY and DISCORD_WEBHOOK_URL are read ONLY from environment
+    variables, which the workflow file populates ONLY from
+    ${{ secrets.* }}. They are never written to state.json, results.json,
+    or any committed file.
+  - Every single log line goes through redact(), which scrubs the exact
+    value of every loaded secret out of the string before it's printed -
+    this is defense-in-depth on top of GitHub's own automatic log
+    masking, which only catches exact-string matches and can miss a
+    secret embedded inside a larger string (e.g. a Discord webhook URL
+    appearing inside a requests exception message).
+  - The Gemini key is sent as a request header, never as a URL query
+    parameter, so it can never end up logged inside a URL.
+  - The workflow this script ships with only triggers on `schedule` and
+    `workflow_dispatch` - NEVER add a `pull_request` or
+    `pull_request_target` trigger to it. Those triggers can run workflow
+    code against untrusted fork contributions, which is the standard way
+    public-repo Actions secrets get exfiltrated. `workflow_dispatch` can
+    only be fired by someone with write access to your repo, so it's safe.
 
 Environment variables required:
     GEMINI_API_KEY       - https://aistudio.google.com/apikey (free tier)
@@ -51,6 +94,7 @@ Environment variables optional:
 
 import json
 import os
+import random
 import re
 import socket
 import sys
@@ -109,6 +153,8 @@ PLATFORM_PATTERNS = [
     re.compile(r"intigriti\.com", re.IGNORECASE),
     re.compile(r"yeswehack\.com", re.IGNORECASE),
     re.compile(r"synack\.com", re.IGNORECASE),
+    re.compile(r"openbugbounty\.org", re.IGNORECASE),
+    re.compile(r"immunefi\.com", re.IGNORECASE),
 ]
 
 BROWSER_HEADERS = {
@@ -122,6 +168,11 @@ REQUEST_TIMEOUT_SECONDS = 4
 CRTSH_MIN_INTERVAL_SECONDS = 13.0  # respects crt.sh's real 5 req/min HTTPS limit
 _last_crtsh_call = [0.0]
 _run_start = time.monotonic()
+
+CRTSH_DB_MAX_ATTEMPTS = 3
+CRTSH_DB_BACKOFF_BASE_SECONDS = 8.0    # 8s, 16s, 32s (+ jitter)
+CRTSH_HTTPS_MAX_ATTEMPTS = 3
+CRTSH_HTTPS_BACKOFF_BASE_SECONDS = 10.0
 
 
 def redact(text):
@@ -148,6 +199,13 @@ def log(msg):
 def time_budget_exceeded():
     elapsed_minutes = (time.monotonic() - _run_start) / 60.0
     return elapsed_minutes >= TIME_BUDGET_MINUTES
+
+
+def _sleep_with_backoff(attempt, base_seconds):
+    """Exponential backoff with jitter. attempt is 0-indexed."""
+    delay = base_seconds * (2 ** attempt) + random.uniform(0, base_seconds / 2)
+    log(f"Backing off {delay:.1f}s before retry (attempt {attempt + 2})")
+    time.sleep(delay)
 
 
 def load_state(state_path):
@@ -263,91 +321,130 @@ def crtsh_query_db(keyword, since_minutes):
     """
     Direct connection to crt.sh's public, read-only Postgres database
     (psql -h crt.sh -p 5432 -U guest certwatch - officially documented by
-    crt.sh's maintainer). Bypasses the HTTPS proxy's rate limit/timeout.
-    Returns a list of (hostname, not_before) tuples, or None on failure.
+    crt.sh's maintainer: https://groups.google.com/g/crtsh). Bypasses the
+    HTTPS proxy's rate limit/timeout.
+
+    crt.sh's own maintainers have repeatedly confirmed on the mailing list
+    that both crt.sh:443 and crt.sh:5432 suffer from real, but transient,
+    overload windows (pgbouncer crashes, storage-array saturation, 502s),
+    and that shared cloud/CI IP ranges (GitHub-hosted runners included)
+    get throttled harder than residential IPs. This retries with backoff
+    before giving up and falling back to HTTPS.
+
+    Returns a list of (hostname, not_before) tuples, or None if every
+    attempt failed (transient outage, not necessarily "no results").
     """
     if not HAVE_PSYCOPG2:
         return None
-    try:
-        conn = psycopg2.connect(
-            host="crt.sh", port=5432, dbname="certwatch", user="guest",
-            connect_timeout=15,
-            options="-c statement_timeout=45000",
-        )
-        conn.autocommit = True
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-        sql = """
-            SELECT DISTINCT ci.NAME_VALUE, x509_notBefore(c.CERTIFICATE) AS not_before
-            FROM certificate_and_identities ci
-            JOIN certificate c ON ci.CERTIFICATE_ID = c.ID
-            WHERE ci.NAME_VALUE ILIKE %s
-              AND x509_notBefore(c.CERTIFICATE) > %s
-            ORDER BY not_before DESC
-            LIMIT 500;
-        """
+
+    last_error = None
+    for attempt in range(CRTSH_DB_MAX_ATTEMPTS):
+        if attempt > 0:
+            _sleep_with_backoff(attempt - 1, CRTSH_DB_BACKOFF_BASE_SECONDS)
         try:
-            with conn.cursor() as cur:
-                cur.execute(sql, (f"%{keyword}%", cutoff))
-                rows = cur.fetchall()
-                return [(r[0], r[1]) for r in rows]
-        finally:
-            conn.close()
-    except Exception as e:
-        log(f"crt.sh direct DB query failed for '{keyword}': {type(e).__name__}: {e}")
-        return None
+            conn = psycopg2.connect(
+                host="crt.sh", port=5432, dbname="certwatch", user="guest",
+                connect_timeout=20,
+                options="-c statement_timeout=60000",
+            )
+            conn.autocommit = True
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+            sql = """
+                SELECT DISTINCT ci.NAME_VALUE, x509_notBefore(c.CERTIFICATE) AS not_before
+                FROM certificate_and_identities ci
+                JOIN certificate c ON ci.CERTIFICATE_ID = c.ID
+                WHERE ci.NAME_VALUE ILIKE %s
+                  AND x509_notBefore(c.CERTIFICATE) > %s
+                ORDER BY not_before DESC
+                LIMIT 500;
+            """
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (f"%{keyword}%", cutoff))
+                    rows = cur.fetchall()
+                    return [(r[0], r[1]) for r in rows]
+            finally:
+                conn.close()
+        except Exception as e:
+            last_error = e
+            log(f"crt.sh direct DB query failed for '{keyword}' "
+                f"(attempt {attempt + 1}/{CRTSH_DB_MAX_ATTEMPTS}): {type(e).__name__}: {e}")
+
+    log(f"crt.sh direct DB query gave up on '{keyword}' after {CRTSH_DB_MAX_ATTEMPTS} attempts: "
+        f"{type(last_error).__name__ if last_error else 'unknown error'}")
+    return None
 
 
 def crtsh_query_https(keyword, since_minutes):
     """HTTPS JSON API fallback - rate-limited to respect crt.sh's real
-    5 requests/minute limit per IP."""
-    elapsed = time.time() - _last_crtsh_call[0]
-    if elapsed < CRTSH_MIN_INTERVAL_SECONDS:
-        time.sleep(CRTSH_MIN_INTERVAL_SECONDS - elapsed)
-    _last_crtsh_call[0] = time.time()
+    5 requests/minute limit per IP, and retried with backoff since
+    crt.sh's overload symptoms (502s/timeouts/bad JSON) are known to be
+    transient rather than permanent."""
+    last_status = None
+    for attempt in range(CRTSH_HTTPS_MAX_ATTEMPTS):
+        if attempt > 0:
+            _sleep_with_backoff(attempt - 1, CRTSH_HTTPS_BACKOFF_BASE_SECONDS)
 
-    try:
-        resp = requests.get(
-            "https://crt.sh/",
-            params={"q": f"%{keyword}%", "output": "json"},
-            timeout=45,
-            headers={"User-Agent": "scanner.py/1.0"},
-        )
-    except requests.exceptions.Timeout:
-        log(f"crt.sh HTTPS query timed out for '{keyword}'")
-        return []
-    except requests.exceptions.ConnectionError as e:
-        log(f"crt.sh HTTPS connection failed for '{keyword}': {e}")
-        return []
-    except requests.RequestException as e:
-        log(f"crt.sh HTTPS request failed for '{keyword}': {e}")
-        return []
+        elapsed = time.time() - _last_crtsh_call[0]
+        if elapsed < CRTSH_MIN_INTERVAL_SECONDS:
+            time.sleep(CRTSH_MIN_INTERVAL_SECONDS - elapsed)
+        _last_crtsh_call[0] = time.time()
 
-    if resp.status_code != 200:
-        log(f"crt.sh HTTPS returned HTTP {resp.status_code} for '{keyword}'")
-        return []
-
-    try:
-        entries = resp.json()
-    except json.JSONDecodeError:
-        log(f"crt.sh HTTPS returned non-JSON for '{keyword}' (likely rate-limited/overloaded)")
-        return []
-
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-    results = []
-    for entry in entries:
-        not_before_raw = entry.get("not_before", "")
         try:
-            not_before = datetime.strptime(not_before_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-        except ValueError:
+            resp = requests.get(
+                "https://crt.sh/",
+                params={"q": f"%{keyword}%", "output": "json"},
+                timeout=45,
+                headers={"User-Agent": "scanner.py/1.0 (+https://github.com/)"},
+            )
+        except requests.exceptions.Timeout:
+            log(f"crt.sh HTTPS query timed out for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS})")
             continue
-        if not_before < cutoff:
+        except requests.exceptions.ConnectionError as e:
+            log(f"crt.sh HTTPS connection failed for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}): {e}")
             continue
-        name_value = entry.get("name_value", "")
-        for host in set(name_value.split("\n")):
-            host = host.strip().lstrip("*.")
-            if host:
-                results.append((host, not_before))
-    return results
+        except requests.RequestException as e:
+            log(f"crt.sh HTTPS request failed for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}): {e}")
+            continue
+
+        last_status = resp.status_code
+
+        if resp.status_code in (429, 502, 503, 504):
+            log(f"crt.sh HTTPS returned HTTP {resp.status_code} for '{keyword}' "
+                f"(attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}), likely transient overload")
+            continue
+
+        if resp.status_code != 200:
+            log(f"crt.sh HTTPS returned HTTP {resp.status_code} for '{keyword}' - not retrying (non-transient)")
+            return []
+
+        try:
+            entries = resp.json()
+        except json.JSONDecodeError:
+            log(f"crt.sh HTTPS returned non-JSON for '{keyword}' (attempt {attempt + 1}/{CRTSH_HTTPS_MAX_ATTEMPTS}), "
+                f"likely rate-limited/overloaded")
+            continue
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+        results = []
+        for entry in entries:
+            not_before_raw = entry.get("not_before", "")
+            try:
+                not_before = datetime.strptime(not_before_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if not_before < cutoff:
+                continue
+            name_value = entry.get("name_value", "")
+            for host in set(name_value.split("\n")):
+                host = host.strip().lstrip("*.")
+                if host:
+                    results.append((host, not_before))
+        return results
+
+    log(f"crt.sh HTTPS gave up on '{keyword}' after {CRTSH_HTTPS_MAX_ATTEMPTS} attempts "
+        f"(last status: {last_status})")
+    return []
 
 
 def gh_headers():
@@ -499,8 +596,8 @@ def fetch_ct_snapshot(since_minutes, run_warnings):
     else:
         path_used = "unavailable this run (expected occasionally from shared CI IPs)"
         run_warnings.append(
-            "crt.sh returned no data on either path this run - this is common from GitHub Actions' "
-            "shared IP ranges and does not affect disclose.io-based discovery"
+            "crt.sh returned no data on either path this run even after retries - this is common from "
+            "GitHub Actions' shared IP ranges and does not affect disclose.io-based discovery"
         )
 
     return list(all_results.items()), path_used
@@ -602,9 +699,9 @@ def gemini_validate(hostname, final_url, redirect_chain, content):
     Sends the fetched page content to Gemini Flash for context validation.
     The model must explicitly return VERDICT: VALID or VERDICT: INVALID,
     with INVALID required for: platform-mediated redirects (HackerOne,
-    Bugcrowd, Intigriti, YesWeHack, Synack) or on-prem enterprise product
-    security notices (e.g. Atlassian, SAP) that are not independent
-    programs run by the domain owner itself.
+    Bugcrowd, Intigriti, YesWeHack, Synack, Open Bug Bounty, Immunefi) or
+    on-prem enterprise product security notices (e.g. Atlassian, SAP)
+    that are not independent programs run by the domain owner itself.
     """
     if not GEMINI_API_KEY:
         log("GEMINI_API_KEY not set - skipping AI validation, cannot confirm this hit")
@@ -623,7 +720,8 @@ Page content (truncated):
 Rules:
 - Return VERDICT: INVALID if the redirect chain or content shows this page
   is actually hosted on or redirects to HackerOne, Bugcrowd, Intigriti,
-  YesWeHack, or Synack (platform-mediated, not self-hosted).
+  YesWeHack, Synack, Open Bug Bounty, or Immunefi (platform-mediated, not
+  self-hosted).
 - Return VERDICT: INVALID if this is an enterprise/on-prem PRODUCT security
   notice page (e.g. a generic Atlassian, SAP, or similar vendor security
   advisory page) rather than an independent program run by the domain
@@ -891,4 +989,3 @@ if __name__ == "__main__":
             pass
         exit_code = 0
     sys.exit(exit_code)
-
