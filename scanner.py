@@ -342,16 +342,35 @@ def crtsh_query_db(keyword, since_minutes):
         if attempt > 0:
             _sleep_with_backoff(attempt - 1, CRTSH_DB_BACKOFF_BASE_SECONDS)
         try:
-            # NOTE: deliberately no `options="-c statement_timeout=..."`
-            # startup parameter here. crt.sh's Postgres sits behind
-            # pgbouncer, which rejects arbitrary startup-packet options
-            # with "unsupported startup parameter: options" - this was a
-            # 100%-reproducible bug (not flakiness) that made every
-            # direct-DB attempt fail immediately, every single time.
-            conn = psycopg2.connect(
+            # Resolve crt.sh to an IPv4 address ourselves and connect via
+            # hostaddr instead of letting libpq resolve "host=crt.sh".
+            # GitHub-hosted runners have IPv6 configured but frequently
+            # have NO working outbound IPv6 route ("Network is
+            # unreachable") - libpq tries the AAAA record first and burns
+            # the whole connect_timeout on a dead route before ever
+            # trying the working IPv4 address. hostaddr skips that.
+            ipv4_addr = None
+            try:
+                infos = socket.getaddrinfo("crt.sh", 5432, socket.AF_INET, socket.SOCK_STREAM)
+                if infos:
+                    ipv4_addr = infos[0][4][0]
+            except socket.gaierror as e:
+                log(f"Could not resolve crt.sh to an IPv4 address: {e}")
+
+            connect_kwargs = dict(
                 host="crt.sh", port=5432, dbname="certwatch", user="guest",
                 connect_timeout=20,
             )
+            if ipv4_addr:
+                connect_kwargs["hostaddr"] = ipv4_addr
+
+            conn = psycopg2.connect(**connect_kwargs)
+            # NOTE: deliberately no `options="-c statement_timeout=..."`
+            # startup parameter. crt.sh's Postgres sits behind pgbouncer,
+            # which rejects arbitrary startup-packet options with
+            # "unsupported startup parameter: options" - this was a
+            # 100%-reproducible bug (not flakiness) that made every
+            # direct-DB attempt fail immediately, every single time.
             conn.autocommit = True
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
             sql = """
@@ -367,10 +386,6 @@ def crtsh_query_db(keyword, since_minutes):
                 with conn.cursor() as cur:
                     # Statement timeout set as a regular query instead of a
                     # startup parameter, for the same pgbouncer reason above.
-                    # If pgbouncer is in transaction/statement pooling mode
-                    # this SET may be a no-op for the backend session, which
-                    # is fine - connect_timeout plus the outer retry/backoff
-                    # loop already bound worst-case behavior.
                     try:
                         cur.execute("SET statement_timeout = 60000;")
                     except Exception:
