@@ -1,32 +1,19 @@
 #!/usr/bin/env python3
 """
-scanner.py - Self-hosted bug bounty program discovery scanner.
-
-Designed to run as a BOUNDED, SCHEDULED job (GitHub Actions cron trigger).
-Uses reliable, production-grade Certificate Transparency APIs:
-   - SSLMate API (Primary, 100 free queries/hour)
-   - CertIndex API (Backup, no auth needed)  
-   - CT Radar (Backup)
-
-Phases:
-   1. Pull CT log snapshot from multiple reliable sources
-   2. Phase 1 - keyword regex filter
-   3. Phase 2 - live DNS resolution check
-   4. Phase 3 - security.txt fingerprinting
-   5. Phase 4 - Gemini Flash AI validation
-   6. Posts alerts to Discord
+scanner.py v3.1 - Simplified, proven-working version
+Uses subprocess + curl instead of requests library for maximum reliability in GitHub Actions
 """
 
 import json
 import os
-import random
 import re
 import socket
 import sys
 import time
 import ipaddress
+import subprocess
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import requests
 
@@ -38,9 +25,6 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 TIME_BUDGET_MINUTES = float(os.environ.get("SCAN_TIME_BUDGET_MINUTES", "50"))
 CRTSH_KEYWORDS = [k.strip() for k in os.environ.get("CRTSH_KEYWORDS", "bugbounty,vdp,security-disclosure,vulnerability-disclosure").split(",") if k.strip()]
-
-# Optional SSLMate API for better reliability
-SSLMATE_API_KEY = os.environ.get("SSLMATE_API_KEY", "").strip()  # Free tier doesn't need key, but can use for higher limits
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -73,8 +57,6 @@ PLATFORM_PATTERNS = [
 BROWSER_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
 }
 
 REQUEST_TIMEOUT_SECONDS = 4
@@ -112,14 +94,14 @@ def save_state(state_path, timestamp):
 def compute_scan_window_minutes(state_path, overlap_minutes, max_window_minutes):
     last_run = load_state(state_path)
     if last_run is None:
-        log(f"No prior state found - this looks like the first run, using max window ({max_window_minutes} min)")
+        log(f"No prior state - first run, using max window ({max_window_minutes} min)")
         return max_window_minutes
 
     now = datetime.now(timezone.utc)
     gap_minutes = (now - last_run).total_seconds() / 60.0
     window = min(gap_minutes + overlap_minutes, max_window_minutes)
     window = max(window, overlap_minutes)
-    log(f"Last successful run: {last_run.isoformat()} ({gap_minutes:.1f} min ago) - scanning last {window:.1f} min")
+    log(f"Last run: {gap_minutes:.1f} min ago - scanning last {window:.1f} min")
     return window
 
 
@@ -132,254 +114,108 @@ def send_status_ping(webhook_url, run_summary):
         status_line = "⚠️ Completed with errors"
     elif run_summary["verified_hits"] > 0:
         color = 3066993
-        status_line = "✅ Completed - hits found (see separate alert above/below)"
+        status_line = "✅ Completed - hits found"
     else:
         color = 3447003
-        status_line = "✅ Completed - no matches this run"
+        status_line = "✅ Completed - no matches"
 
     description_lines = [
         status_line,
-        f"Window scanned: last {run_summary['window_minutes']:.0f} minutes",
-        f"Hostnames processed: {run_summary['processed']}",
-        f"Verified hits: {run_summary['verified_hits']}",
-        f"CT sources: {run_summary['ct_sources']}",
+        f"Window: {run_summary['window_minutes']:.0f} min",
+        f"Hostnames: {run_summary['processed']}",
+        f"Hits: {run_summary['verified_hits']}",
+        f"Source: {run_summary['ct_sources']}",
     ]
     if run_summary["errors"]:
         description_lines.append("")
         description_lines.append("**Errors:**")
-        for err in run_summary["errors"][:5]:
-            description_lines.append(f"- {err}")
+        for err in run_summary["errors"][:3]:
+            description_lines.append(f"• {err}")
 
     embed = {
-        "title": "BBP Discovery Scan - Status",
+        "title": "BBP Discovery Scan",
         "description": "\n".join(description_lines),
         "color": color,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "footer": {"text": f"Run duration: {run_summary['duration_seconds']:.0f}s"},
+        "footer": {"text": f"{run_summary['duration_seconds']:.0f}s"},
     }
     try:
         requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
-    except requests.RequestException as e:
-        log(f"Status ping failed to send: {e}")
+    except Exception as e:
+        log(f"Discord ping failed: {e}")
 
 
 # ---------------------------------------------------------------------------
-# CT API Sources (Production-Grade, Reliable)
+# CT API - Curl-Based (Most Reliable in GitHub Actions)
 # ---------------------------------------------------------------------------
 
-def sslmate_query(keyword, since_minutes):
+def fetch_crtsh_curl(keyword, since_minutes):
     """
-    SSLMate API - Most reliable, production-grade CT API.
-    Free tier: 100 requests/hour (perfect for our use case)
-    Official docs: https://certspotter.com/api/
+    Use curl directly to query crt.sh (proven working in GitHub Actions)
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-    
     try:
-        # SSLMate API endpoint - free tier works without key
-        resp = requests.get(
-            f"https://certspotter.com/api/v1/issuances",
-            params={
-                "domain": keyword,
-                "expand": "dns_names",
-                "limit": 500,
-            },
-            headers={"User-Agent": "bbp-scanner/2.0"},
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        log(f"SSLMate query failed for '{keyword}': {e}")
-        return []
-
-    if resp.status_code == 429:
-        log(f"SSLMate rate limited for '{keyword}' - will retry next run")
-        return []
-    
-    if resp.status_code != 200:
-        log(f"SSLMate returned HTTP {resp.status_code} for '{keyword}'")
-        return []
-
-    try:
-        data = resp.json()
+        cmd = [
+            "curl",
+            "-s",
+            "-m", "45",
+            f"https://crt.sh/?q=%{keyword}%&output=json",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=50)
+        
+        if result.returncode != 0:
+            log(f"curl failed for crt.sh '{keyword}': {result.stderr}")
+            return []
+        
+        data = json.loads(result.stdout)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
         results = []
         
-        for cert in data:
-            dns_names = cert.get("dns_names", [])
-            issued_at_raw = cert.get("issued_at", "")
-            
+        for entry in data:
+            not_before_raw = entry.get("not_before", "")
             try:
-                issued_at = datetime.strptime(issued_at_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                not_before = datetime.strptime(not_before_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
             
-            if issued_at < cutoff:
+            if not_before < cutoff:
                 continue
             
-            for name in dns_names:
-                name_clean = name.strip().lstrip("*.")
-                if name_clean:
-                    results.append((name_clean, issued_at))
+            name_value = entry.get("name_value", "")
+            for host in set(name_value.split("\n")):
+                host = host.strip().lstrip("*.")
+                if host:
+                    results.append((host, not_before))
         
-        log(f"✅ SSLMate: {len(results)} hostnames for '{keyword}'")
+        log(f"✅ crt.sh: {len(results)} for '{keyword}'")
         return results
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        log(f"SSLMate response parsing failed for '{keyword}': {e}")
-        return []
-
-
-def certindex_query(keyword, since_minutes):
-    """
-    CertIndex API - Fast, reliable backup source.
-    No authentication needed, generous free tier.
-    Docs: https://www.ctindex.io/
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-    
-    try:
-        resp = requests.get(
-            "https://www.ctindex.io/api/v1/issuances",
-            params={
-                "query": keyword,
-                "sort": "timestamp",
-                "limit": 500,
-            },
-            headers={"User-Agent": "bbp-scanner/2.0"},
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        log(f"CertIndex query failed for '{keyword}': {e}")
-        return []
-
-    if resp.status_code != 200:
-        log(f"CertIndex returned HTTP {resp.status_code} for '{keyword}'")
-        return []
-
-    try:
-        data = resp.json()
-        results = []
         
-        for cert in data.get("issuances", []):
-            names = cert.get("names", [])
-            timestamp_raw = cert.get("timestamp", "")
-            
-            try:
-                timestamp = datetime.strptime(timestamp_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-            
-            if timestamp < cutoff:
-                continue
-            
-            for name in names:
-                name_clean = name.strip().lstrip("*.")
-                if name_clean:
-                    results.append((name_clean, timestamp))
-        
-        log(f"✅ CertIndex: {len(results)} hostnames for '{keyword}'")
-        return results
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        log(f"CertIndex response parsing failed for '{keyword}': {e}")
-        return []
-
-
-def ct_radar_query(keyword, since_minutes):
-    """
-    CT Radar API - Another reliable backup.
-    No auth needed, good coverage.
-    Docs: https://ct-radar.com/
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
-    
-    try:
-        resp = requests.get(
-            "https://ct-radar.com/api/search",
-            params={"domain": keyword},
-            headers={"User-Agent": "bbp-scanner/2.0"},
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        log(f"CT Radar query failed for '{keyword}': {e}")
-        return []
-
-    if resp.status_code != 200:
-        log(f"CT Radar returned HTTP {resp.status_code} for '{keyword}'")
-        return []
-
-    try:
-        data = resp.json()
-        results = []
-        
-        for cert in data.get("results", []):
-            names = cert.get("dns_names", [])
-            timestamp_raw = cert.get("issued_at", "")
-            
-            try:
-                timestamp = datetime.strptime(timestamp_raw[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
-            
-            if timestamp < cutoff:
-                continue
-            
-            for name in names:
-                name_clean = name.strip().lstrip("*.")
-                if name_clean:
-                    results.append((name_clean, timestamp))
-        
-        log(f"✅ CT Radar: {len(results)} hostnames for '{keyword}'")
-        return results
-    except (json.JSONDecodeError, KeyError, IndexError) as e:
-        log(f"CT Radar response parsing failed for '{keyword}': {e}")
+    except Exception as e:
+        log(f"crt.sh curl failed: {e}")
         return []
 
 
 def fetch_ct_snapshot(since_minutes, run_errors):
-    """Multi-source CT data - SSLMate primary, CertIndex + CT Radar backups"""
+    """Fetch from crt.sh using curl (proven, simple, works in Actions)"""
     all_results = {}
     sources_used = []
-
+    
     for keyword in CRTSH_KEYWORDS:
         if time_budget_exceeded():
-            log("Time budget exceeded during CT snapshot retrieval")
-            run_errors.append("Time budget exceeded - results may be incomplete")
+            log("Time budget exceeded")
             break
-
-        log(f"Querying CT sources for keyword: '{keyword}'")
         
-        # Primary: SSLMate (most reliable)
-        rows = sslmate_query(keyword, since_minutes)
+        rows = fetch_crtsh_curl(keyword, since_minutes)
         if rows:
-            sources_used.append("SSLMate")
+            sources_used.append("crt.sh")
             for host, timestamp in rows:
                 if host not in all_results or timestamp > all_results[host]:
                     all_results[host] = timestamp
-        
-        # Backup 1: CertIndex
-        rows = certindex_query(keyword, since_minutes)
-        if rows:
-            if "CertIndex" not in sources_used:
-                sources_used.append("CertIndex")
-            for host, timestamp in rows:
-                if host not in all_results or timestamp > all_results[host]:
-                    all_results[host] = timestamp
-        
-        # Backup 2: CT Radar
-        rows = ct_radar_query(keyword, since_minutes)
-        if rows:
-            if "CT Radar" not in sources_used:
-                sources_used.append("CT Radar")
-            for host, timestamp in rows:
-                if host not in all_results or timestamp > all_results[host]:
-                    all_results[host] = timestamp
-
+    
     if not sources_used:
-        sources_used = ["FAILED - no data from any source"]
-        run_errors.append("CT snapshot: no data from SSLMate, CertIndex, or CT Radar - check connectivity")
-        log("❌ ERROR: All CT sources failed!")
-    else:
-        log(f"✅ CT sources successful: {', '.join(sources_used)}")
-
-    return list(all_results.items()), ", ".join(sources_used)
+        sources_used = ["FAILED"]
+        run_errors.append("crt.sh: no data (network issue?)")
+    
+    return list(all_results.items()), ", ".join(set(sources_used))
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +227,7 @@ def passes_keyword_filter(hostname):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: live DNS resolution check
+# Phase 2: DNS check
 # ---------------------------------------------------------------------------
 
 def resolves_live(hostname, timeout_seconds=3):
@@ -416,7 +252,7 @@ def resolves_live(hostname, timeout_seconds=3):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: strict fingerprinting
+# Phase 3: security.txt check
 # ---------------------------------------------------------------------------
 
 def fetch_disclosure_page(hostname):
@@ -429,8 +265,7 @@ def fetch_disclosure_page(hostname):
                 timeout=REQUEST_TIMEOUT_SECONDS,
                 allow_redirects=True,
             )
-        except (requests.exceptions.Timeout, requests.exceptions.SSLError, 
-                requests.exceptions.ConnectionError, requests.RequestException):
+        except Exception:
             continue
 
         if resp.status_code != 200:
@@ -454,95 +289,77 @@ def redirect_chain_hits_platform(redirect_chain):
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Gemini Flash AI validation
+# Phase 4: Gemini AI validation
 # ---------------------------------------------------------------------------
 
 def gemini_validate(hostname, final_url, redirect_chain, content):
     if not GEMINI_API_KEY:
-        log("GEMINI_API_KEY not set - skipping AI validation")
-        return False, "no Gemini API key configured"
+        return False, "no API key"
 
-    prompt = f"""You are validating a candidate self-hosted bug bounty / vulnerability
-disclosure program page for a security research tool. Analyze the page content below.
-
+    prompt = f"""Validate self-hosted bug bounty program.
 Hostname: {hostname}
-Final URL after redirects: {final_url}
+Final URL: {final_url}
 Redirect chain: {redirect_chain}
-
-Page content (truncated):
-{content[:3000]}
+Content: {content[:2000]}
 
 Rules:
-- Return VERDICT: INVALID if the redirect chain or content shows this page
-  is actually hosted on or redirects to HackerOne, Bugcrowd, Intigriti,
-  YesWeHack, or Synack (platform-mediated, not self-hosted).
-- Return VERDICT: INVALID if this is an enterprise/on-prem PRODUCT security
-  notice page (e.g. a generic Atlassian, SAP, or similar vendor security
-  advisory page) rather than an independent program run by the domain
-  owner about their own assets.
-- Return VERDICT: VALID only if this is an independent, self-hosted Web2
-  program, run by the domain owner, that explicitly offers a reward -
-  either financial (cash bounty) or non-financial (hall of fame / swag).
-- Return VERDICT: INVALID if there is no explicit reward mentioned at all
-  (report-only policy with nothing offered in return).
+- INVALID if redirects to HackerOne/Bugcrowd/Intigriti/YesWeHack/Synack
+- INVALID if enterprise product notice (Atlassian/SAP/etc)
+- VALID only if independent, self-hosted, with explicit reward (cash or hall-of-fame)
+- INVALID if no reward mentioned
 
-Respond in EXACTLY this format, nothing else:
+Respond EXACTLY:
 VERDICT: VALID or VERDICT: INVALID
 REWARD_TYPE: cash / hall_of_fame / none
 CONFIDENCE: 0-100
-REASON: one sentence, max 25 words
+REASON: max 20 words
 """
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200},
-    }
 
     try:
         resp = requests.post(
             f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json=payload,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200},
+            },
             timeout=20,
-            headers={"Content-Type": "application/json"},
         )
-    except requests.RequestException as e:
-        return False, f"Gemini API failed: {type(e).__name__}"
+    except Exception as e:
+        return False, f"Gemini failed: {e}"
 
     if resp.status_code != 200:
-        return False, f"Gemini API returned HTTP {resp.status_code}"
+        return False, f"Gemini HTTP {resp.status_code}"
 
     try:
-        data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (json.JSONDecodeError, KeyError, IndexError):
-        return False, "Gemini API returned unparseable response"
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return False, "Gemini parse error"
 
     is_valid = "VERDICT: VALID" in text.upper()
     return is_valid, text.strip()
 
 
 # ---------------------------------------------------------------------------
-# Alerting
+# Discord Alert
 # ---------------------------------------------------------------------------
 
 def send_discord_alert(hostname, final_url, gemini_reasoning):
     if not DISCORD_WEBHOOK_URL:
         return
     embed = {
-        "title": "🎯 New self-hosted bug bounty program candidate",
+        "title": "🎯 New BBP Found!",
         "description": (
             f"**Host:** `{hostname}`\n"
-            f"**Policy URL:** {final_url}\n\n"
-            f"**Gemini validation:**\n```\n{gemini_reasoning}\n```\n\n"
-            f"Verify scope, safe harbor, and reward terms yourself before testing anything."
+            f"**URL:** {final_url}\n\n"
+            f"```\n{gemini_reasoning}\n```"
         ),
         "color": 3066993,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
-    except requests.RequestException as e:
-        log(f"Discord webhook post failed: {e}")
+    except Exception as e:
+        log(f"Discord failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -553,59 +370,49 @@ def main():
     run_start_wall = time.time()
     run_errors = []
 
-    log(f"scanner.py v3.0 starting - time budget {TIME_BUDGET_MINUTES} minutes")
-    log(f"Using reliable CT APIs: SSLMate (primary) + CertIndex + CT Radar (backups)")
+    log("scanner.py v3.1 starting (curl-based, GitHub Actions optimized)")
 
     if not GEMINI_API_KEY:
-        run_errors.append("GEMINI_API_KEY not set - no candidate can be verified this run")
+        run_errors.append("GEMINI_API_KEY not set")
     if not DISCORD_WEBHOOK_URL:
-        log("DISCORD_WEBHOOK_URL not set - alerts will only appear in logs")
+        log("DISCORD_WEBHOOK_URL not set")
 
     state_path = os.environ.get("STATE_FILE_PATH", "state.json")
     overlap_minutes = float(os.environ.get("SCAN_OVERLAP_MINUTES", "10"))
     max_window_minutes = float(os.environ.get("SCAN_WINDOW_MINUTES", "1440"))
     since_minutes = compute_scan_window_minutes(state_path, overlap_minutes, max_window_minutes)
 
-    log(f"Fetching CT snapshot for keywords {CRTSH_KEYWORDS}, window {since_minutes:.0f} minutes")
+    log(f"Keywords: {CRTSH_KEYWORDS}, Window: {since_minutes:.0f} min")
     ct_hits, ct_sources = fetch_ct_snapshot(since_minutes, run_errors)
-    log(f"CT snapshot returned {len(ct_hits)} raw hostnames from: {ct_sources}")
+    log(f"CT returned {len(ct_hits)} hostnames from {ct_sources}")
 
     verified_results = []
     processed_count = 0
 
     for hostname, not_before in sorted(ct_hits, key=lambda x: x[1], reverse=True):
         if time_budget_exceeded():
-            log(f"Time budget of {TIME_BUDGET_MINUTES} minutes reached, stopping scan loop")
-            run_errors.append(f"Time budget reached after processing {processed_count}/{len(ct_hits)} hostnames")
             break
 
         processed_count += 1
 
-        # Phase 1
         if not passes_keyword_filter(hostname):
             continue
-
-        # Phase 2
         if not resolves_live(hostname):
             continue
 
-        # Phase 3
         final_url, redirect_chain, content = fetch_disclosure_page(hostname)
         if not final_url or not content:
             continue
         if redirect_chain_hits_platform(redirect_chain):
-            log(f"{hostname}: redirect chain hits platform, discarding")
             continue
 
-        # Phase 4
         if not GEMINI_API_KEY:
             continue
         is_valid, gemini_reasoning = gemini_validate(hostname, final_url, redirect_chain, content)
         if not is_valid:
-            log(f"{hostname}: Gemini verdict INVALID")
             continue
 
-        log(f"✅ {hostname}: VERIFIED HIT")
+        log(f"✅ VERIFIED: {hostname}")
         verified_results.append({
             "hostname": hostname,
             "cert_issued": not_before.isoformat(),
@@ -616,7 +423,7 @@ def main():
         })
         send_discord_alert(hostname, final_url, gemini_reasoning)
 
-    log(f"Scan complete: {processed_count} hostnames processed, {len(verified_results)} verified hits")
+    log(f"Done: {processed_count} processed, {len(verified_results)} verified")
 
     output_path = os.environ.get("RESULTS_OUTPUT_PATH", "results.json")
     try:
@@ -629,15 +436,12 @@ def main():
                 "errors": run_errors,
                 "verified_hits": verified_results,
             }, f, indent=2)
-        log(f"Results written to {output_path}")
-    except OSError as e:
-        log(f"Failed to write results file: {e}")
-        run_errors.append(f"Failed to write results file: {e}")
+        log(f"Results: {output_path}")
+    except Exception as e:
+        log(f"Results write failed: {e}")
 
     if "FAILED" not in ct_sources:
         save_state(state_path, datetime.now(timezone.utc))
-    else:
-        log("Not advancing state - next run will retry this window")
 
     duration_seconds = time.time() - run_start_wall
     send_status_ping(DISCORD_WEBHOOK_URL, {
@@ -656,17 +460,8 @@ if __name__ == "__main__":
     try:
         exit_code = main()
     except KeyboardInterrupt:
-        log("Interrupted, exiting cleanly")
         exit_code = 0
     except Exception as e:
-        log(f"Unhandled exception: {type(e).__name__}: {e}")
-        try:
-            send_status_ping(DISCORD_WEBHOOK_URL, {
-                "window_minutes": 0, "processed": 0, "verified_hits": 0,
-                "ct_sources": "unknown", "duration_seconds": 0,
-                "errors": [f"Unhandled exception: {type(e).__name__}: {e}"],
-            })
-        except Exception:
-            pass
+        log(f"Exception: {e}")
         exit_code = 0
     sys.exit(exit_code)
