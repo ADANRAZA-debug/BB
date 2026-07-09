@@ -6,11 +6,25 @@ name: Self-Hosted BBP Discovery Scan
 # a substitute for an always-on server (see GitHub's Acceptable Use
 # Policies). Every run here does one bounded pass and exits.
 #
-# Every 30 minutes is deliberate, not arbitrary: crt.sh (whichever path
-# is used) and Gemini's free tier don't meaningfully benefit from being
-# polled more often than this, and state.json makes each run pick up
-# exactly where the last one left off - so 30 min intervals still catch
-# everything continuously, just without the overhead of nonstop polling.
+# PUBLIC REPO NOTE: public repositories get unlimited free GitHub Actions
+# minutes on standard runners (private repos are capped at 2,000 min/month
+# free). That's why this can run every 10 minutes instead of every 30 -
+# cost is no longer the limiting factor, only crt.sh's and Gemini's own
+# rate limits are. Adjust the cron value below if you want it slower.
+#
+# SECRET SAFETY (public repo): this workflow never echoes GEMINI_API_KEY
+# or DISCORD_WEBHOOK_URL to logs. scanner.py additionally redacts any
+# accidental occurrence of these values from every log line it prints, on
+# top of GitHub Actions' own automatic secret masking. Neither secret is
+# ever written into state.json or results.json (both only ever contain
+# hostnames, program names, and Gemini's text verdicts - nothing from the
+# secrets themselves). This workflow also only triggers on `schedule` and
+# `workflow_dispatch`, never on `pull_request` - so even if someone forks
+# this public repo and opens a PR, GitHub does not grant that PR run
+# access to your repo's secrets (this is GitHub's own default behavior,
+# not something configured here). Still: don't add untrusted collaborators
+# with write access, and review any PR that modifies this workflow file
+# before merging it, regardless.
 #
 # If you need a true persistent certstream websocket listener, run
 # scanner.py's underlying logic on a real host you control instead -
@@ -18,7 +32,7 @@ name: Self-Hosted BBP Discovery Scan
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes
+    - cron: '*/10 * * * *'   # every 10 minutes - free on a public repo
   workflow_dispatch:          # manual trigger from the Actions tab
 
 concurrency:
@@ -31,7 +45,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 55   # hard platform-level backstop above the script's own 50-min budget
+    timeout-minutes: 9   # keep well under the 10-min schedule interval so runs never overlap
 
     steps:
       - name: Checkout repository
@@ -53,21 +67,132 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          SCAN_TIME_BUDGET_MINUTES: '50'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCAN_TIME_BUDGET_MINUTES: '8'
           SCAN_WINDOW_MINUTES: '1440'
           SCAN_OVERLAP_MINUTES: '10'
           CRTSH_KEYWORDS: 'bugbounty,vdp'
           STATE_FILE_PATH: 'state.json'
           RESULTS_OUTPUT_PATH: 'results.json'
+          SUMMARY_OUTPUT_PATH: 'summary.json'
         run: python3 scanner.py
 
-      - name: Upload results as build artifact
+      - name: Upload PUBLIC-SAFE summary as build artifact
+        # Deliberately uploads summary.json (counts only), never
+        # results.json (full hostnames/URLs/AI reasoning). This is a
+        # public repo - anyone with a GitHub account can view and
+        # download Actions artifacts, so full hit detail only ever goes
+        # to your private Discord webhook, never into a public artifact.
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results-${{ github.run_id }}
-          path: results.json
-          retention-days: 14
+          name: scan-summary-${{ github.run_id }}
+          path: summary.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Commit updated state.json back to the repo
+        if: always()
+        run: |
+          git config user.name "bbp-scanner-bot"
+          git config user.email "actions@users.noreply.github.com"
+          if [ -f state.json ]; then
+            git add state.json
+            git diff --cached --quiet || git commit -m "chore: update scan state [skip ci]"
+            git push
+          else
+            echo "No state.json produced this run, nothing to commit"
+          finame: Self-Hosted BBP Discovery Scan
+
+# Runs on a normal cron schedule - a bounded, scheduled job, NOT a
+# persistent process or a self-retriggering repository_dispatch loop.
+# GitHub Actions does not support and does not permit workflows used as
+# a substitute for an always-on server (see GitHub's Acceptable Use
+# Policies). Every run here does one bounded pass and exits.
+#
+# PUBLIC REPO NOTE: public repositories get unlimited free GitHub Actions
+# minutes on standard runners (private repos are capped at 2,000 min/month
+# free). That's why this can run every 10 minutes instead of every 30 -
+# cost is no longer the limiting factor, only crt.sh's and Gemini's own
+# rate limits are. Adjust the cron value below if you want it slower.
+#
+# SECRET SAFETY (public repo): this workflow never echoes GEMINI_API_KEY
+# or DISCORD_WEBHOOK_URL to logs. scanner.py additionally redacts any
+# accidental occurrence of these values from every log line it prints, on
+# top of GitHub Actions' own automatic secret masking. Neither secret is
+# ever written into state.json or results.json (both only ever contain
+# hostnames, program names, and Gemini's text verdicts - nothing from the
+# secrets themselves). This workflow also only triggers on `schedule` and
+# `workflow_dispatch`, never on `pull_request` - so even if someone forks
+# this public repo and opens a PR, GitHub does not grant that PR run
+# access to your repo's secrets (this is GitHub's own default behavior,
+# not something configured here). Still: don't add untrusted collaborators
+# with write access, and review any PR that modifies this workflow file
+# before merging it, regardless.
+#
+# If you need a true persistent certstream websocket listener, run
+# scanner.py's underlying logic on a real host you control instead -
+# GitHub-hosted runners are the wrong tool for that specific job.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 minutes - free on a public repo
+  workflow_dispatch:          # manual trigger from the Actions tab
+
+concurrency:
+  group: bbp-discovery-scan
+  cancel-in-progress: false   # never kill a run already in progress
+
+permissions:
+  contents: write   # needed to commit state.json back to the repo
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9   # keep well under the 10-min schedule interval so runs never overlap
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Run scanner (bounded, single pass)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCAN_TIME_BUDGET_MINUTES: '8'
+          SCAN_WINDOW_MINUTES: '1440'
+          SCAN_OVERLAP_MINUTES: '10'
+          CRTSH_KEYWORDS: 'bugbounty,vdp'
+          STATE_FILE_PATH: 'state.json'
+          RESULTS_OUTPUT_PATH: 'results.json'
+          SUMMARY_OUTPUT_PATH: 'summary.json'
+        run: python3 scanner.py
+
+      - name: Upload PUBLIC-SAFE summary as build artifact
+        # Deliberately uploads summary.json (counts only), never
+        # results.json (full hostnames/URLs/AI reasoning). This is a
+        # public repo - anyone with a GitHub account can view and
+        # download Actions artifacts, so full hit detail only ever goes
+        # to your private Discord webhook, never into a public artifact.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-summary-${{ github.run_id }}
+          path: summary.json
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Commit updated state.json back to the repo
