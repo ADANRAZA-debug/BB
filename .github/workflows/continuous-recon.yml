@@ -103,8 +103,24 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           if [ -f state.json ]; then
             git add state.json
-            git diff --cached --quiet || git commit -m "chore: update scan state [skip ci]"
-            git push
+            if git diff --cached --quiet; then
+              echo "state.json unchanged, nothing to commit"
+              exit 0
+            fi
+
+            git commit -m "chore: update scan state [skip ci]"
+
+            for attempt in 1 2 3; do
+              if git push origin HEAD:${GITHUB_REF_NAME}; then
+                exit 0
+              fi
+              echo "Push rejected (likely non-fast-forward). Fetching latest ${GITHUB_REF_NAME} and retrying (${attempt}/3)..."
+              git fetch origin ${GITHUB_REF_NAME}
+              git rebase origin/${GITHUB_REF_NAME}
+            done
+
+            echo "Failed to push state.json after 3 attempts"
+            exit 1
           else
             echo "No state.json produced this run, nothing to commit"
           fi
